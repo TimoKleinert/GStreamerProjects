@@ -9,7 +9,7 @@
 /* Structure to contain all our information, so we can pass it to callbacks */
 typedef struct _CustomData
 {
-  GstElement *pipeline, *video_source, *rtph_depay, *av_dec, *video_convert, *app_sink;
+  GstElement *pipeline, *video_source, *rtph_depay, *av_dec, *video_convert, *tee, *app_queue, *video_queue, *app_sink, *video_sink;
   gboolean snapshot;
   GMainLoop *main_loop;         /* GLib's Main Loop */
 
@@ -42,7 +42,6 @@ handle_keyboard (GIOChannel * source, GIOCondition cond, CustomData * data)
 /* The appsink has received a buffer */
 static GstFlowReturn new_sample (GstElement * sink, CustomData * data)
 {
-
   if(data->snapshot){
     GstSample *sample;
     /* Retrieve the buffer */
@@ -101,6 +100,8 @@ static GstFlowReturn new_sample (GstElement * sink, CustomData * data)
 int tutorial_main (int argc, char *argv[])
 {
   CustomData data;
+  GstPad *tee_video_pad, *tee_app_pad;
+  GstPad *queue_video_pad, *queue_app_pad;
   data.snapshot = FALSE;
   GIOChannel *io_stdin;
   /* Initialize GStreamer */
@@ -111,6 +112,10 @@ int tutorial_main (int argc, char *argv[])
   data.rtph_depay = gst_element_factory_make( "rtph264depay", "rtph_depay");
   data.av_dec = gst_element_factory_make ("avdec_h264", "av_dec");
   data.video_convert = gst_element_factory_make ("videoconvert", "video_convert");
+  data.tee = gst_element_factory_make("tee", "tee");
+  data.video_queue = gst_element_factory_make("queue", "video_queue");
+  data.app_queue = gst_element_factory_make("queue", "app_queue");
+  data.video_sink = gst_element_factory_make("autovideosink", "video_sink");
   data.app_sink = gst_element_factory_make ("appsink", "app_sink");
 
   /* Create the empty pipeline */
@@ -131,12 +136,35 @@ int tutorial_main (int argc, char *argv[])
 
 
   /* Link all elements that can be automatically linked because they have "Always" pads */
-  gst_bin_add_many (GST_BIN (data.pipeline), data.video_source, data.rtph_depay, data.av_dec, data.video_convert, data.app_sink, NULL);
-  if (gst_element_link_many (data.video_source, data.rtph_depay, data.av_dec, data.video_convert, data.app_sink, NULL) != TRUE) {
+  gst_bin_add_many (GST_BIN (data.pipeline), data.video_source, data.rtph_depay, data.av_dec, data.video_convert, data.tee,
+                             data.app_queue, data.video_queue, data.app_sink, data.video_sink, NULL);
+                             
+  if (gst_element_link_many (data.video_source, data.rtph_depay, data.av_dec, data.video_convert, data.tee, NULL) != TRUE
+      || gst_element_link_many (data.video_queue, data.video_sink, NULL) != TRUE
+      || gst_element_link_many (data.app_queue, data.app_sink, NULL) != TRUE) {
     g_printerr ("Elements could not be linked.\n");
     gst_object_unref (data.pipeline);
     return -1;
   }
+
+  /* Manually link the Tee, which has "Request" pads */
+  tee_video_pad = gst_element_request_pad_simple (data.tee, "src_%u");
+  g_print ("Obtained request pad %s for video branch.\n",
+      gst_pad_get_name (tee_video_pad));
+  queue_video_pad = gst_element_get_static_pad (data.video_queue, "sink");
+  tee_app_pad = gst_element_request_pad_simple (data.tee, "src_%u");
+  g_print ("Obtained request pad %s for app branch.\n",
+      gst_pad_get_name (tee_app_pad));
+  queue_app_pad = gst_element_get_static_pad (data.app_queue, "sink");
+  if (gst_pad_link (tee_video_pad, queue_video_pad) != GST_PAD_LINK_OK ||
+      gst_pad_link (tee_app_pad, queue_app_pad) != GST_PAD_LINK_OK) {
+    g_printerr ("Tee could not be linked\n");
+    gst_object_unref (data.pipeline);
+    return -1;
+  }
+  gst_object_unref (queue_video_pad);
+  gst_object_unref (queue_app_pad);
+
 
   io_stdin = g_io_channel_unix_new (fileno (stdin));
   g_io_add_watch (io_stdin, G_IO_IN, (GIOFunc) handle_keyboard, &data);
